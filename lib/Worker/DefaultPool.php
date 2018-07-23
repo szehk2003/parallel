@@ -2,9 +2,9 @@
 
 namespace Amp\Parallel\Worker;
 
-use Amp\CallableMaker;
 use Amp\Parallel\Context\StatusError;
-use Amp\Promise;
+use Concurrent\Task as AsyncTask;
+use function Concurrent\all;
 
 /**
  * Provides a pool of workers that can be used to execute multiple tasks asynchronously.
@@ -13,9 +13,8 @@ use Amp\Promise;
  * tasks simultaneously. The load on each worker is balanced such that tasks
  * are completed as soon as possible and workers are used efficiently.
  */
-class DefaultPool implements Pool {
-    use CallableMaker;
-
+class DefaultPool implements Pool
+{
     /** @var bool Indicates if the pool is currently running. */
     private $running = true;
 
@@ -40,14 +39,15 @@ class DefaultPool implements Pool {
     /**
      * Creates a new worker pool.
      *
-     * @param int $maxSize The maximum number of workers the pool should spawn.
+     * @param int                                     $maxSize The maximum number of workers the pool should spawn.
      *     Defaults to `Pool::DEFAULT_MAX_SIZE`.
      * @param \Amp\Parallel\Worker\WorkerFactory|null $factory A worker factory to be used to create
      *     new workers.
      *
      * @throws \Error
      */
-    public function __construct(int $maxSize = self::DEFAULT_MAX_SIZE, WorkerFactory $factory = null) {
+    public function __construct(int $maxSize = self::DEFAULT_MAX_SIZE, WorkerFactory $factory = null)
+    {
         if ($maxSize < 0) {
             throw new \Error("Maximum size must be a non-negative integer");
         }
@@ -87,7 +87,8 @@ class DefaultPool implements Pool {
      *
      * @return bool True if the pool is running, otherwise false.
      */
-    public function isRunning(): bool {
+    public function isRunning(): bool
+    {
         return $this->running;
     }
 
@@ -96,28 +97,32 @@ class DefaultPool implements Pool {
      *
      * @return bool True if the pool has at least one idle worker, otherwise false.
      */
-    public function isIdle(): bool {
+    public function isIdle(): bool
+    {
         return $this->idleWorkers->count() > 0 || $this->workers->count() === 0;
     }
 
     /**
      * {@inheritdoc}
      */
-    public function getMaxSize(): int {
+    public function getMaxSize(): int
+    {
         return $this->maxSize;
     }
 
     /**
      * {@inheritdoc}
      */
-    public function getWorkerCount(): int {
+    public function getWorkerCount(): int
+    {
         return $this->workers->count();
     }
 
     /**
      * {@inheritdoc}
      */
-    public function getIdleWorkerCount(): int {
+    public function getIdleWorkerCount(): int
+    {
         return $this->idleWorkers->count();
     }
 
@@ -126,29 +131,31 @@ class DefaultPool implements Pool {
      *
      * @param Task $task The task to enqueue.
      *
-     * @return \Amp\Promise<mixed> The return value of Task::run().
+     * @return mixed The return value of Task::run().
      *
-     * @throws \Amp\Parallel\Context\StatusError If the pool has been shutdown.
-     * @throws \Amp\Parallel\Worker\TaskException If the task throws an exception.
+     * @throws StatusError If the pool has been shutdown.
+     * @throws TaskException If the task throws an exception.
      */
-    public function enqueue(Task $task): Promise {
+    public function enqueue(Task $task)
+    {
         $worker = $this->pull();
 
-        $promise = $worker->enqueue($task);
-        $promise->onResolve(function () use ($worker) {
+        try {
+            return $worker->enqueue($task);
+        } finally {
             ($this->push)($worker);
-        });
-        return $promise;
+        }
     }
 
     /**
      * Shuts down the pool and all workers in it.
      *
-     * @return \Amp\Promise<int[]> Array of exit status from all workers.
+     * @return int Sum of exit status from all workers.
      *
-     * @throws \Amp\Parallel\Context\StatusError If the pool has not been started.
+     * @throws StatusError If the pool has not been started.
      */
-    public function shutdown(): Promise {
+    public function shutdown(): int
+    {
         if (!$this->isRunning()) {
             throw new StatusError("The pool was shutdown");
         }
@@ -158,17 +165,18 @@ class DefaultPool implements Pool {
         $shutdowns = [];
         foreach ($this->workers as $worker) {
             if ($worker->isRunning()) {
-                $shutdowns[] = $worker->shutdown();
+                $shutdowns[] = AsyncTask::async([$worker, 'shutdown']);
             }
         }
 
-        return Promise\all($shutdowns);
+        return array_sum($shutdowns ? AsyncTask::await(all($shutdowns)) : []);
     }
 
     /**
      * Kills all workers in the pool and halts the worker pool.
      */
-    public function kill() {
+    public function kill(): void
+    {
         $this->running = false;
 
         foreach ($this->workers as $worker) {
@@ -181,7 +189,8 @@ class DefaultPool implements Pool {
      *
      * @return Worker The worker created.
      */
-    private function createWorker() {
+    private function createWorker()
+    {
         $worker = $this->factory->create();
         $this->workers->attach($worker, 0);
         return $worker;
@@ -190,7 +199,8 @@ class DefaultPool implements Pool {
     /**
      * {@inheritdoc}
      */
-    public function get(): Worker {
+    public function get(): Worker
+    {
         return new Internal\PooledWorker($this->pull(), $this->push);
     }
 
@@ -198,9 +208,10 @@ class DefaultPool implements Pool {
      * Pulls a worker from the pool. The worker should be put back into the pool with push() to be marked as idle.
      *
      * @return \Amp\Parallel\Worker\Worker
-     * @throws \Amp\Parallel\Context\StatusError
+     * @throws StatusError
      */
-    protected function pull(): Worker {
+    protected function pull(): Worker
+    {
         if (!$this->isRunning()) {
             throw new StatusError("The pool was shutdown");
         }
@@ -240,7 +251,8 @@ class DefaultPool implements Pool {
      *
      * @throws \Error If the worker was not part of this queue.
      */
-    protected function push(Worker $worker) {
+    protected function push(Worker $worker)
+    {
         ($this->push)($worker); // Kept for BC
     }
 }

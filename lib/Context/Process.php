@@ -3,17 +3,17 @@
 namespace Amp\Parallel\Context;
 
 use Amp\ByteStream;
+use Amp\Parallel\Sync\Channel;
 use Amp\Parallel\Sync\ChannelException;
 use Amp\Parallel\Sync\ChannelledStream;
 use Amp\Parallel\Sync\ExitResult;
 use Amp\Parallel\Sync\SynchronizationError;
 use Amp\Process\Process as BaseProcess;
-use Amp\Promise;
-use function Amp\asyncCall;
-use function Amp\call;
+use Amp\Process\StatusError;
+use Concurrent\Task;
 
 class Process implements Context {
-    const SCRIPT_PATH = __DIR__ . "/Internal/process-runner.php";
+    private const SCRIPT_PATH = __DIR__ . "/Internal/process-runner.php";
 
     /** @var string|null External version of SCRIPT_PATH if inside a PHAR. */
     private static $pharScriptPath;
@@ -24,10 +24,10 @@ class Process implements Context {
     /** @var string|null Cached path to located PHP binary. */
     private static $binaryPath;
 
-    /** @var \Amp\Process\Process */
+    /** @var BaseProcess */
     private $process;
 
-    /** @var \Amp\Parallel\Sync\Channel */
+    /** @var Channel */
     private $channel;
 
     /**
@@ -39,11 +39,12 @@ class Process implements Context {
      * @param mixed[]      $env Array of environment variables.
      * @param string       $binary Path to PHP binary. Null will attempt to automatically locate the binary.
      *
-     * @return \Amp\Parallel\Context\Process
+     * @return Process
      */
     public static function run($script, string $cwd = null, array $env = [], string $binary = null): self {
         $process = new self($script, $cwd, $env, $binary);
         $process->start();
+
         return $process;
     }
 
@@ -143,7 +144,7 @@ class Process implements Context {
         throw new \Error("Could not locate PHP executable binary");
     }
 
-    private function formatOptions(array $options) {
+    private function formatOptions(array $options): string {
         $result = [];
 
         foreach ($options as $option => $value) {
@@ -162,7 +163,7 @@ class Process implements Context {
     /**
      * {@inheritdoc}
      */
-    public function start() {
+    public function start(): void {
         $this->process->start();
         $this->channel = new ChannelledStream($this->process->getStdout(), $this->process->getStdin());
 
@@ -170,9 +171,8 @@ class Process implements Context {
         $childStderr = $this->process->getStderr();
         $childStderr->unreference();
 
-        asyncCall(static function () use ($childStderr) {
-            $stderr = new ByteStream\ResourceOutputStream(\STDERR);
-            yield ByteStream\pipe($childStderr, $stderr);
+        Task::async(static function () use ($childStderr) {
+            ByteStream\pipe($childStderr, new ByteStream\ResourceOutputStream(\STDERR));
         });
     }
 
@@ -186,34 +186,32 @@ class Process implements Context {
     /**
      * {@inheritdoc}
      */
-    public function receive(): Promise {
+    public function receive() {
         if ($this->channel === null) {
             throw new StatusError("The process has not been started");
         }
 
-        return call(function () {
-            try {
-                $data = yield $this->channel->receive();
-            } catch (ChannelException $e) {
-                throw new ContextException("The context stopped responding, potentially due to a fatal error or calling exit", 0, $e);
-            }
+        try {
+            $data = $this->channel->receive();
+        } catch (ChannelException $e) {
+            throw new ContextException("The context stopped responding, potentially due to a fatal error or calling exit", 0, $e);
+        }
 
-            if ($data instanceof ExitResult) {
-                $data = $data->getResult();
-                throw new SynchronizationError(\sprintf(
-                    'Process unexpectedly exited with result of type: %s',
-                    \is_object($data) ? \get_class($data) : \gettype($data)
-                ));
-            }
+        if ($data instanceof ExitResult) {
+            $data = $data->getResult();
+            throw new SynchronizationError(\sprintf(
+                'Process unexpectedly exited with result of type: %s',
+                \is_object($data) ? \get_class($data) : \gettype($data)
+            ));
+        }
 
-            return $data;
-        });
+        return $data;
     }
 
     /**
      * {@inheritdoc}
      */
-    public function send($data): Promise {
+    public function send($data): void {
         if ($this->channel === null) {
             throw new StatusError("The process has not been started");
         }
@@ -222,35 +220,38 @@ class Process implements Context {
             throw new \Error("Cannot send exit result objects");
         }
 
-        return $this->channel->send($data);
+        $this->channel->send($data);
     }
 
     /**
      * {@inheritdoc}
      */
-    public function join(): Promise {
+    public function join() {
         if ($this->channel === null) {
             throw new StatusError("The process has not been started");
         }
 
-        return call(function () {
+        try {
+            $data = $this->channel->receive();
+            if (!$data instanceof ExitResult) {
+                throw new SynchronizationError("Did not receive an exit result from process");
+            }
+        } catch (\Throwable $exception) {
             try {
-                $data = yield $this->channel->receive();
-                if (!$data instanceof ExitResult) {
-                    throw new SynchronizationError("Did not receive an exit result from process");
+                if ($this->isRunning()) {
+                    $this->kill();
                 }
-            } catch (\Throwable $exception) {
-                $this->kill();
+            } finally {
                 throw $exception;
             }
+        }
 
-            $code = yield $this->process->join();
-            if ($code !== 0) {
-                throw new ContextException(\sprintf("Process exited with code %d", $code));
-            }
+        $code = $this->process->join();
+        if ($code !== 0) {
+            throw new ContextException(\sprintf("Process exited with code %d", $code));
+        }
 
-            return $data->getResult();
-        });
+        return $data->getResult();
     }
 
     /**
@@ -261,28 +262,29 @@ class Process implements Context {
      * @param int $signo
      *
      * @throws \Amp\Process\ProcessException
-     * @throws \Amp\Process\StatusError
+     * @throws StatusError
      */
     public function signal(int $signo) {
         $this->process->signal($signo);
     }
 
     /**
-     * Returns a promise resolving to the process PID.
+     * Returns the process PID.
      *
      * @see \Amp\Process\Process::getPid()
      *
-     * @return \Amp\Promise
-     * @throws \Amp\Process\StatusError
+     * @return int
+     *
+     * @throws StatusError
      */
-    public function getPid(): Promise {
+    public function getPid(): int {
         return $this->process->getPid();
     }
 
     /**
      * {@inheritdoc}
      */
-    public function kill() {
+    public function kill(): void {
         $this->process->kill();
     }
 }
